@@ -4,216 +4,127 @@
 # Enhanced RabbitMQ Transport Usage Examples
 # This file demonstrates how to use the enhanced routing capabilities
 
+require 'securerandom'
+require 'smart_message'
 require_relative '../lib/smart_message/transport/rabbitmq'
 
-# Example message classes
-class OrderMessage < SmartMessage::Base
-  property :order_id, required: true
-  property :customer_id, required: true
-  property :amount, required: true
-  
-  def process
-    puts "Processing order #{order_id} for customer #{customer_id}: $#{amount}"
-  end
-end
+# Load message classes
+require_relative 'messages/order_message'
+require_relative 'messages/alert_message'
+require_relative 'messages/system_message'
 
-class AlertMessage < SmartMessage::Base
-  property :severity, required: true
-  property :message, required: true
-  property :service, required: true
-  
-  def process
-    puts "ALERT [#{severity}] from #{service}: #{message}"
-  end
-end
+# Create JSON serializer
+serializer = SmartMessage::Serializer::Json.new
 
-class SystemMessage < SmartMessage::Base
-  property :type, required: true
-  property :data
-  
-  def process
-    puts "System #{type}: #{data}"
-  end
-end
-
-# Initialize transport
+# Initialize transport with required serializer parameter
 transport = SmartMessage::Transport::RabbitMQ.new(
+  serializer: serializer,
   host: 'localhost',
   port: 5672,
   exchange_name: 'smart_message_demo'
 )
 
+# Configure SmartMessage with transport as default
+SmartMessage.configure do |config|
+  config.transport = transport
+end
+
+# Connect the transport
 transport.connect
 
-puts "=== Enhanced RabbitMQ Routing Demo ==="
-puts
+# Log demo program start
+transport.send(:logger).info { "[Demo] Enhanced RabbitMQ Routing Demo started - PID #{Process.pid}" }
 
-# Example 1: Basic pattern subscriptions
-puts "1. Setting up basic pattern subscriptions..."
+puts "Setting up subscriptions..."
 
-# Subscribe to all messages sent to 'order_service'
-transport.subscribe_to_recipient('order_service')
-puts "   ✓ Subscribed to all messages for order_service"
+# Set up unified subscription API with new architecture
+# Subscribe to specific message classes
+transport.subscribe(OrderMessage) { |msg| puts "Processing OrderMessage: #{msg.order_id}" }
+transport.subscribe(AlertMessage) { |msg| puts "Processing AlertMessage: #{msg.severity} - #{msg.message}" }
+transport.subscribe(SystemMessage) { |msg| puts "Processing SystemMessage: #{msg.type}" }
 
-# Subscribe to all messages from 'payment_gateway'
-transport.subscribe_from_sender('payment_gateway')
-puts "   ✓ Subscribed to all messages from payment_gateway"
+# Subscribe to multiple message classes at once
+transport.subscribe([OrderMessage, AlertMessage], nil, { to: 'order_service' }) do |msg|
+  puts "Processing #{msg.class.name} targeted to order_service"
+end
 
-# Subscribe to all alerts
-transport.subscribe_to_alerts
-puts "   ✓ Subscribed to all alert messages"
-
-# Subscribe to all broadcasts
-transport.subscribe_to_broadcasts
-puts "   ✓ Subscribed to all broadcast messages"
-
-puts
-
-# Example 2: Advanced pattern subscriptions
-puts "2. Setting up advanced pattern subscriptions..."
-
-# Subscribe to specific patterns
-transport.subscribe_pattern("#.*.user_123", :process)
-puts "   ✓ Subscribed to all messages for user_123"
-
-transport.subscribe_pattern("emergency.#.*.*", :process)
-puts "   ✓ Subscribed to all emergency messages"
-
-transport.subscribe_pattern("*.ordermessage.payment_gateway.*", :process)
-puts "   ✓ Subscribed to order messages from payment_gateway"
-
-puts
-
-# Example 3: Fluent API subscriptions
-puts "3. Setting up fluent API subscriptions..."
-
-# Complex subscription using fluent API
+# Use fluent API for complex routing
 transport.where
+  .message_class(OrderMessage)
   .from('api_server')
   .to('order_service')
-  .type('ordermessage')
-  .subscribe
-puts "   ✓ Subscribed to order messages from api_server to order_service"
+  .subscribe { |msg| puts "API server order for order service: #{msg.order_id}" }
 
-transport.where
-  .namespace('system')
-  .to('monitor')
-  .subscribe
-puts "   ✓ Subscribed to all system messages sent to monitor"
+puts "Publishing messages..."
 
-puts
-
-# Example 4: Publishing with enhanced routing
-puts "4. Publishing messages with enhanced routing..."
-
-# Create messages with routing information
+# Create and publish messages using new transport-centric architecture
 order_msg = OrderMessage.new(
   order_id: "ORD-001",
   customer_id: "CUST-123",
-  amount: 99.99
+  amount: 99.99,
+  _sm_header: { uuid: SecureRandom.uuid, message_class: 'OrderMessage', from: 'api_server', to: 'order_service' }
 )
-
-# Set routing information in header
-order_msg._sm_header.from = 'api_server'
-order_msg._sm_header.to = 'order_service'
 
 alert_msg = AlertMessage.new(
   severity: 'critical',
   message: 'Database connection lost',
-  service: 'order_db'
+  service: 'order_db',
+  _sm_header: { uuid: SecureRandom.uuid, message_class: 'AlertMessage', from: 'monitor_service', to: 'alert_service' }
 )
-
-# Alert to monitoring system
-alert_msg._sm_header.from = 'order_db'
-alert_msg._sm_header.to = 'monitor'
 
 system_msg = SystemMessage.new(
   type: 'heartbeat',
-  data: { timestamp: Time.now.to_i, status: 'ok' }
+  data: { timestamp: Time.now.to_i, status: 'ok' },
+  _sm_header: { uuid: SecureRandom.uuid, message_class: 'SystemMessage', from: 'system_monitor', to: 'broadcast' }
 )
 
-# Broadcast system message
-system_msg._sm_header.from = 'api_server'
-system_msg._sm_header.to = 'broadcast'
+# Publish using new routing options pattern
+order_msg.publish(from: 'api_server', to: 'order_service')
+alert_msg.publish(from: 'order_db', to: 'monitor')
+system_msg.publish(from: 'api_server', to: 'broadcast')
 
-# Publish messages
-puts "Publishing order message (api_server → order_service)..."
-order_msg.publish
-
-puts "Publishing alert message (order_db → monitor)..."
-alert_msg.publish
-
-puts "Publishing system broadcast (api_server → broadcast)..."
-system_msg.publish
-
-puts
-
-# Example 5: Dynamic subscription based on runtime conditions
-puts "5. Dynamic subscription patterns..."
-
+puts "Setting up dynamic subscriptions..."
 user_id = "user_#{rand(1000)}"
 service_id = "service_#{rand(100)}"
 
-# Subscribe to messages for a dynamic user
-transport.subscribe_to_recipient(user_id)
-puts "   ✓ Dynamically subscribed to messages for #{user_id}"
-
-# Subscribe to messages from a dynamic service
-transport.subscribe_from_sender(service_id)
-puts "   ✓ Dynamically subscribed to messages from #{service_id}"
-
-puts
-
-# Example 6: Monitoring and debugging patterns
-puts "6. Monitoring and debugging patterns..."
-
-if ENV['DEBUG']
-  # In debug mode, log all traffic
-  transport.subscribe_pattern("#", :process)
-  puts "   ✓ DEBUG: Subscribed to ALL messages"
+# Subscribe with dynamic routing filters
+transport.subscribe([OrderMessage, AlertMessage], nil, { to: user_id }) do |msg|
+  puts "Message for user #{user_id}: #{msg.class.name}"
 end
 
-# Monitor specific communication channels
-transport.subscribe_pattern("*.*.payment_gateway.order_service", :process)
-puts "   ✓ Monitoring payment_gateway → order_service communication"
+transport.subscribe([OrderMessage, AlertMessage], nil, { from: service_id }) do |msg|
+  puts "Message from service #{service_id}: #{msg.class.name}"
+end
 
-transport.subscribe_pattern("emergency.#.*.*", :process)
-puts "   ✓ Monitoring all emergency traffic"
+puts "Setting up monitoring patterns..."
+if ENV['DEBUG']
+  # Subscribe to all message classes for debugging
+  transport.subscribe([OrderMessage, AlertMessage, SystemMessage]) do |msg|
+    puts "DEBUG: #{msg.class.name} - #{msg.inspect}"
+  end
+end
 
-puts
-
-# Example 7: Cleanup and shutdown
-puts "7. Cleanup..."
+# Subscribe with regex pattern for message class matching
+transport.subscribe(/.*Message$/) { |msg| puts "Monitoring pattern matched: #{msg.class.name}" }
 
 # In a real application, you'd handle shutdown gracefully
 at_exit do
+  transport.send(:logger).info { "[Demo] Enhanced RabbitMQ Routing Demo shutting down - PID #{Process.pid}" }
   puts "Shutting down transport..."
   transport.disconnect
   puts "Transport disconnected."
+  transport.send(:logger).info { "[Demo] Enhanced RabbitMQ Routing Demo completed - PID #{Process.pid}" }
 end
 
-puts "Demo setup complete! Messages are now being routed based on enhanced patterns."
-puts "Run this script and publish messages to see the routing in action."
-puts
-puts "Example routing keys that will be generated:"
-puts "  ordermessage → ordermessage.api_server.order_service"
-puts "  alertmessage → alertmessage.order_db.monitor"
-puts "  systemmessage → systemmessage.api_server.broadcast"
-puts
-puts "Example subscription patterns in effect:"
-puts "  #.*.order_service        → All messages TO order_service"
-puts "  #.payment_gateway.*      → All messages FROM payment_gateway"
-puts "  emergency.#.*.*          → All emergency messages"
-puts "  #.*.broadcast            → All broadcast messages"
-puts "  *.ordermessage.*.*       → All order messages"
+puts "Demo setup complete!"
 
 # Keep the script running to process messages
 if ARGV.include?('--run')
-  puts "\nPress Ctrl+C to exit..."
+  puts "Press Ctrl+C to exit..."
   begin
     sleep
   rescue Interrupt
-    puts "\nShutting down..."
+    puts "Shutting down..."
     transport.disconnect
     exit 0
   end

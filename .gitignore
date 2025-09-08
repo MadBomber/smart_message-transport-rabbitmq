@@ -7,3 +7,6 @@
 /spec/reports/
 /tmp/
 /.aigcm_msg/
+log
+/sig/
+.aigcm_msg

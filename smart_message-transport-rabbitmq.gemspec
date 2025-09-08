@@ -32,7 +32,11 @@ Gem::Specification.new do |spec|
   spec.executables = spec.files.grep(%r{\Aexe/}) { |f| File.basename(f) }
   spec.require_paths = ["lib"]
 
-  spec.add_dependency "smart_message"
+  # Runtime dependencies
+  spec.add_dependency "bunny", "~> 2.20"
+
+  # Use local development version
+  # spec.add_dependency "smart_message"
 
   spec.add_development_dependency "debug_me"
   spec.add_development_dependency "minitest"
