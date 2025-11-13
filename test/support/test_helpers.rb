@@ -3,32 +3,45 @@
 require 'timeout'
 
 module TestHelpers
-  # Create a test transport with mocked RabbitMQ connection
+  # RabbitMQ test configuration
+  TEST_RABBITMQ_CONFIG = {
+    host: ENV['RABBITMQ_HOST'] || 'localhost',
+    port: ENV['RABBITMQ_PORT']&.to_i || 5672,
+    username: ENV['RABBITMQ_USERNAME'] || 'guest',
+    password: ENV['RABBITMQ_PASSWORD'] || 'guest',
+    vhost: ENV['RABBITMQ_VHOST'] || '/',
+    exchange_name: 'test_smart_message'
+  }.freeze
+
+  # Check if RabbitMQ is available
+  def rabbitmq_available?
+    require 'bunny'
+    connection = Bunny.new(TEST_RABBITMQ_CONFIG.slice(:host, :port, :username, :password, :vhost))
+    connection.start
+    connection.close
+    true
+  rescue => e
+    false
+  end
+
+  # Skip test if RabbitMQ is not available
+  def skip_without_rabbitmq
+    skip "RabbitMQ not available at #{TEST_RABBITMQ_CONFIG[:host]}:#{TEST_RABBITMQ_CONFIG[:port]}" unless rabbitmq_available?
+  end
+
+  # Create a test transport with real RabbitMQ connection
   def create_test_transport(**options)
-    defaults = {
-      serializer: MockSerializer.new,
-      host: 'localhost',
-      port: 5672,
-      exchange_name: 'test_exchange'
-    }
+    skip_without_rabbitmq
 
-    transport = SmartMessage::Transport::RabbitMQ.new(**defaults.merge(options))
+    config = TEST_RABBITMQ_CONFIG.merge(options)
+    config[:serializer] ||= MockSerializer.new
 
-    # Replace connection with mock
-    mock_connection = MockRabbitMQ::MockConnection.new
-    mock_connection.start
-    mock_channel = mock_connection.create_channel
-    mock_exchange = mock_channel.exchange(
-      defaults.merge(options)[:exchange_name],
-      type: :topic,
-      durable: true
-    )
+    transport = SmartMessage::Transport::RabbitMQ.new(**config)
+    transport.connect
 
-    transport.instance_variable_set(:@connection, mock_connection)
-    transport.instance_variable_set(:@channel, mock_channel)
-    transport.instance_variable_set(:@exchange, mock_exchange)
-    transport.instance_variable_set(:@queues, {})
-    transport.instance_variable_set(:@consumers, {})
+    # Store for cleanup
+    @test_transports ||= []
+    @test_transports << transport
 
     transport
   end
@@ -38,7 +51,55 @@ module TestHelpers
     transport = create_test_transport(**options)
     yield transport
   ensure
-    transport&.disconnect rescue nil
+    cleanup_transport(transport)
+  end
+
+  # Cleanup transport and its resources
+  def cleanup_transport(transport)
+    return unless transport
+
+    begin
+      # Delete all test queues
+      channel = transport.instance_variable_get(:@channel)
+      queues = transport.instance_variable_get(:@queues)
+
+      queues.each_key do |queue_name|
+        channel.queue(queue_name).delete rescue nil
+      end
+
+      transport.disconnect
+    rescue => e
+      # Ignore cleanup errors
+    end
+  end
+
+  # Cleanup all test transports
+  def cleanup_all_transports
+    return unless @test_transports
+
+    @test_transports.each do |transport|
+      cleanup_transport(transport)
+    end
+    @test_transports.clear
+  end
+
+  # Clean up test exchange
+  def cleanup_test_exchange
+    skip_without_rabbitmq
+
+    begin
+      require 'bunny'
+      connection = Bunny.new(TEST_RABBITMQ_CONFIG.slice(:host, :port, :username, :password, :vhost))
+      connection.start
+      channel = connection.create_channel
+
+      # Delete test exchange if it exists
+      channel.exchange_delete(TEST_RABBITMQ_CONFIG[:exchange_name]) rescue nil
+
+      connection.close
+    rescue => e
+      # Ignore cleanup errors
+    end
   end
 
   # Wait for a condition to be met within timeout
@@ -55,67 +116,48 @@ module TestHelpers
   end
 
   # Wait for a message to be received
-  def wait_for_message(timeout: 1, &block)
+  def wait_for_message(timeout: 2, &block)
     result = wait_for(timeout: timeout, &block)
     flunk "Message not received within #{timeout} seconds" unless result
     result
   end
 
-  # Assert that a message was published with specific routing key
+  # Assert that a message was published
   def assert_published(transport, routing_key, message: nil)
-    exchange = transport.instance_variable_get(:@exchange)
-    published_messages = exchange.published_messages
+    # With real RabbitMQ, we need to subscribe and wait for the message
+    received = []
 
-    matching = if message
-      published_messages.any? do |msg|
-        msg[:routing_key] == routing_key && msg[:payload].include?(message)
-      end
-    else
-      published_messages.any? { |msg| msg[:routing_key] == routing_key }
-    end
-
-    assert matching, "Expected message with routing key '#{routing_key}' to be published"
-  end
-
-  # Refute that a message was published with specific routing key
-  def refute_published(transport, routing_key)
-    exchange = transport.instance_variable_get(:@exchange)
-    published = exchange.published_messages.any? do |msg|
-      msg[:routing_key] == routing_key
-    end
-    refute published, "Expected no message with routing key '#{routing_key}' to be published"
-  end
-
-  # Get published messages from transport
-  def get_published_messages(transport)
-    exchange = transport.instance_variable_get(:@exchange)
-    exchange.published_messages
-  end
-
-  # Clear published messages
-  def clear_published_messages(transport)
-    exchange = transport.instance_variable_get(:@exchange)
-    exchange.clear_published_messages
-  end
-
-  # Get queue for message class
-  def get_queue(transport, queue_name)
     channel = transport.instance_variable_get(:@channel)
-    channel.queues[queue_name]
+    exchange = transport.instance_variable_get(:@exchange)
+
+    # Create temporary queue to check for message
+    temp_queue = channel.queue("", exclusive: true, auto_delete: true)
+    temp_queue.bind(exchange, routing_key: routing_key)
+
+    # Try to get message (non-blocking)
+    delivery_info, properties, payload = temp_queue.pop
+
+    if delivery_info
+      received << payload
+      temp_queue.delete
+    end
+
+    assert received.any?, "Expected message with routing key '#{routing_key}' to be published"
   end
 
-  # Simulate message reception
-  def simulate_message_reception(transport, message_class, payload, routing_key)
-    delivery_info = MockRabbitMQ::MockDeliveryInfo.new(
-      delivery_tag: rand(1000),
-      routing_key: routing_key
-    )
+  # Get published message count (approximation with real RabbitMQ)
+  def get_published_message_count(transport, queue_name)
+    channel = transport.instance_variable_get(:@channel)
+    queue = channel.queue(queue_name, passive: true)
+    queue.message_count
+  rescue Bunny::NotFound
+    0
+  end
 
-    properties = MockRabbitMQ::MockProperties.new(
-      headers: { 'message_class' => message_class }
-    )
-
-    transport.send(:receive, message_class, payload)
+  # Purge a queue
+  def purge_queue(transport, queue_name)
+    channel = transport.instance_variable_get(:@channel)
+    channel.queue(queue_name).purge rescue nil
   end
 
   # Create mock serializer
@@ -126,13 +168,6 @@ module TestHelpers
   # Create test message
   def create_test_message(klass, **attributes)
     klass.new(**attributes)
-  end
-
-  # Assert circuit breaker state
-  def assert_circuit_state(transport, circuit_name, expected_state)
-    # This will be implemented when circuit breaker is added
-    # For now, just skip
-    skip "Circuit breaker not yet implemented"
   end
 
   # Assert consumer exists for queue
@@ -157,5 +192,16 @@ module TestHelpers
   def queue_count(transport)
     queues = transport.instance_variable_get(:@queues)
     queues.length
+  end
+
+  # Minitest hooks for cleanup
+  def setup
+    super if defined?(super)
+    @test_transports = []
+  end
+
+  def teardown
+    cleanup_all_transports
+    super if defined?(super)
   end
 end
