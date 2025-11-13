@@ -18,6 +18,7 @@ module SmartMessage
           @last_failure_time = nil
           @success_count = 0
           @mutex = Mutex.new
+          @on_state_change = config[:on_state_change]
         end
 
         def call(&block)
@@ -127,6 +128,9 @@ module SmartMessage
           old_state = @state
           @state = new_state
           logger.info { "[CircuitBreaker] #{@name}: #{old_state} -> #{new_state}" }
+
+          # Notify state change callback if provided
+          @on_state_change&.call(old_state, new_state)
         end
 
         def execute_fallback(error)
