@@ -228,10 +228,89 @@ module SmartMessage
 
 
       private
-      
+
       # Override to use RabbitMQ-native dispatcher that leverages topic routing
       def create_dispatcher
         RabbitMQDispatcher.new
+      end
+
+      # Build standard 3-component routing key: {message_class}.{to}.{from}
+      # @param message [Object] Message instance
+      # @param routing_options [Hash] Routing options with :to and :from keys
+      # @return [String] Formatted routing key
+      def build_standard_routing_key(message, routing_options = {})
+        message_class = message.class.to_s
+        to = sanitize_routing_component(routing_options[:to] || 'broadcast')
+        from = sanitize_routing_component(routing_options[:from] || 'anonymous')
+
+        "#{message_class}.#{to}.#{from}"
+      end
+
+      # Sanitize a routing key component by replacing invalid characters
+      # @param value [String, Symbol] Component to sanitize
+      # @return [String] Sanitized component
+      def sanitize_routing_component(value)
+        value.to_s.gsub(/[^a-zA-Z0-9_\-]/, '_')
+      end
+
+      # Resolve message classes from various input types
+      # @param message_classes [Class, Array<Class>, String, Symbol, Regexp] Input to resolve
+      # @return [Array<Class>] Array of message classes
+      def resolve_message_classes(message_classes)
+        case message_classes
+        when Class
+          [message_classes]
+        when Array
+          message_classes.flat_map { |mc| resolve_message_classes(mc) }
+        when String, Symbol
+          # Convert string/symbol to class constant
+          [Object.const_get(message_classes.to_s)]
+        when Regexp
+          # Find all SmartMessage descendants matching the pattern
+          SmartMessage::Base.descendants.select do |klass|
+            klass.name =~ message_classes
+          end
+        else
+          raise ArgumentError, "Invalid message_classes type: #{message_classes.class}"
+        end
+      end
+
+      # Resolve handler from various input types
+      # @param handler [Proc, Method, String, nil] Handler to resolve
+      # @param block [Proc, nil] Block handler
+      # @param message_classes [Array<Class>] Message classes being subscribed
+      # @return [Proc] Resolved handler
+      def resolve_handler(handler, block, message_classes)
+        # Block takes precedence
+        return block if block
+
+        # Use provided handler
+        return handler if handler.is_a?(Proc) || handler.is_a?(Method)
+
+        # String handler format: "ClassName.method_name"
+        return handler if handler.is_a?(String)
+
+        # No handler provided, try to use default process method
+        if message_classes.length == 1 && message_classes.first.method_defined?(:process)
+          proc { |msg| msg.process }
+        else
+          raise ArgumentError, "No handler provided and message class(es) don't define :process method"
+        end
+      end
+
+      # Remove all handlers for a message class (public method)
+      # @param message_class [String, Class] Message class to unsubscribe
+      public def unsubscribe!(message_class)
+        message_class_str = message_class.to_s
+
+        # Remove from dispatcher
+        @dispatcher.drop_all(message_class_str)
+
+        # Stop and remove consumer
+        queue_name = derive_queue_name(message_class_str)
+        stop_consumer(queue_name)
+
+        logger.info { "[RabbitMQ] Unsubscribed all handlers for #{message_class_str}" }
       end
 
       def connect_to_rabbitmq

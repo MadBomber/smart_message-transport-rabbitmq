@@ -6,7 +6,7 @@ require "minitest/mock"
 class SmartMessage::Transport::TestRabbitmq < Minitest::Test
   def setup
     @serializer = MockSerializer.new
-    @transport = SmartMessage::Transport::RabbitMQ.new(serializer: @serializer)
+    @transport = create_test_transport(serializer: @serializer)
   end
 
   def test_that_it_has_a_version_number

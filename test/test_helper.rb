@@ -32,6 +32,85 @@ module SmartMessage
     end
   end
 
+  module Transport
+    class Base
+      attr_reader :serializer, :dispatcher, :options
+
+      def initialize(serializer:, **options)
+        @serializer = serializer
+        @options = merge_options(options)
+        @dispatcher = create_dispatcher
+      end
+
+      def default_options
+        {}
+      end
+
+      def merge_options(options)
+        default_options.merge(options)
+      end
+
+      def create_dispatcher
+        RoutingDispatcher.new
+      end
+
+      def logger
+        SmartMessage::Logger.default
+      end
+
+      # Stub methods that subclasses should implement
+      def configure
+        # Override in subclass
+      end
+
+      def connect
+        # Override in subclass
+      end
+
+      def disconnect
+        # Override in subclass
+      end
+
+      def connected?
+        false
+      end
+
+      def publish(message, **options)
+        # Override in subclass
+      end
+
+      def subscribe(message_classes, handler = nil, options = {}, &block)
+        resolved_classes = resolve_message_classes(message_classes)
+        resolved_handler = resolve_handler(handler, block, resolved_classes)
+
+        resolved_classes.each do |message_class|
+          @dispatcher.add(message_class.to_s, resolved_handler, options)
+        end
+      end
+
+      def unsubscribe(message_class, handler)
+        @dispatcher.drop(message_class.to_s, handler)
+      end
+
+      def receive(message_class, payload)
+        message = @serializer.decode(payload)
+        @dispatcher.route(message, nil)
+      end
+
+      protected
+
+      def resolve_message_classes(message_classes)
+        # Override in subclass
+        []
+      end
+
+      def resolve_handler(handler, block, message_classes)
+        # Override in subclass
+        block || handler
+      end
+    end
+  end
+
   class FluentSubscriptionBuilder
     def initialize(transport)
       @transport = transport

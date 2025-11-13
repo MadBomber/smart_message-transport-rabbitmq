@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require 'securerandom'
+
 # Test message classes for use in test suite
 
 module TestMessages

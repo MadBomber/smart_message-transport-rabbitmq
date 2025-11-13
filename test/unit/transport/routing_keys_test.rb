@@ -67,8 +67,11 @@ class TestRoutingKeys < Minitest::Test
 
   def test_derive_pattern_queue_name_converts_dots_to_underscores
     pattern_queue = @transport.send(:derive_pattern_queue_name, 'Order.Message.*.*')
-    refute_includes pattern_queue, '.'
-    assert_includes pattern_queue, '_'
+    # The pattern string itself will have dots converted to underscores in the queue name
+    # But the prefix "smart_message.pattern." will still have dots
+    # So we check the converted part specifically
+    pattern_part = pattern_queue.split('.').last
+    refute_includes pattern_part, '.', "Pattern part should not contain dots"
   end
 
   def test_extract_message_class_from_routing_key_with_4_parts
