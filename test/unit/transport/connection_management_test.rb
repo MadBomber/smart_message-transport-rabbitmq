@@ -100,14 +100,7 @@ class TestConnectionManagement < Minitest::Test
       prefetch: 25
     )
 
-    mock_connection = MockRabbitMQ::MockConnection.new
-    mock_connection.start
-    mock_channel = mock_connection.create_channel
-    mock_channel.prefetch(25)
-
-    transport.instance_variable_set(:@connection, mock_connection)
-    transport.instance_variable_set(:@channel, mock_channel)
-
-    assert_equal 25, mock_channel.prefetch_count
+    # Test that the prefetch option is stored correctly
+    assert_equal 25, transport.options[:prefetch]
   end
 end

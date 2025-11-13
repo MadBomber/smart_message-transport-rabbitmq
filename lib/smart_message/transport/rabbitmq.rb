@@ -28,18 +28,24 @@ module SmartMessage
         prefetch: 10
       }.freeze
 
-      attr_reader :connection, :channel, :exchange, :queues, :consumers
+      attr_reader :connection, :channel, :exchange, :queues, :consumers, :dlq, :circuits
 
       def initialize(serializer:, **options)
         super(serializer: serializer, **options)
         @queues = {}
         @consumers = {}
         @shutdown = false
+        @circuits = {}
+        @dlq = nil
+
+        # Initialize circuit breakers
+        initialize_circuits
       end
 
       def configure
         connect_to_rabbitmq
         setup_exchange
+        setup_dead_letter_queue
         logger.info { "[RabbitMQ] Transport configured with exchange: #{@options[:exchange_name]}" }
       end
 
@@ -48,30 +54,39 @@ module SmartMessage
       end
 
       def do_publish(message_class, serialized_message, routing_key, routing_options = {})
-        logger.info { "[RabbitMQ] Publishing #{message_class} (#{serialized_message.bytesize} bytes) with routing key: #{routing_key}" }
-        logger.info { "[RabbitMQ] Message content: #{serialized_message}" }
-        
-        # Extract routing components for headers (backward compatibility)
-        routing_parts = routing_key.split('.')
-        to_recipient = routing_parts[-2] if routing_parts.length >= 3
-        from_sender = routing_parts[-1] if routing_parts.length >= 3
-        
-        @exchange.publish(
-          serialized_message,
-          routing_key: routing_key,
-          persistent: true,
-          timestamp: Time.now.to_i,
-          content_type: 'application/json',
-          headers: {
-            message_class: message_class.to_s,
-            smart_message_version: SmartMessage::VERSION,
-            from: from_sender,
-            to: to_recipient,
-            routing_key: routing_key
-          }
-        )
-        
-        logger.info { "[RabbitMQ] Successfully published #{message_class} to #{to_recipient} from #{from_sender}" }
+        # Use circuit breaker for publishing
+        @circuits[:publish].call do
+          logger.info { "[RabbitMQ] Publishing #{message_class} (#{serialized_message.bytesize} bytes) with routing key: #{routing_key}" }
+          logger.debug { "[RabbitMQ] Message content: #{serialized_message}" }
+
+          # Extract routing components for headers (backward compatibility)
+          routing_parts = routing_key.split('.')
+          to_recipient = routing_parts[-2] if routing_parts.length >= 3
+          from_sender = routing_parts[-1] if routing_parts.length >= 3
+
+          @exchange.publish(
+            serialized_message,
+            routing_key: routing_key,
+            persistent: true,
+            timestamp: Time.now.to_i,
+            content_type: 'application/json',
+            headers: {
+              message_class: message_class.to_s,
+              smart_message_version: SmartMessage::VERSION,
+              from: from_sender,
+              to: to_recipient,
+              routing_key: routing_key
+            }
+          )
+
+          logger.info { "[RabbitMQ] Successfully published #{message_class} to #{to_recipient} from #{from_sender}" }
+        end
+      rescue CircuitBreaker::CircuitOpenError => e
+        logger.error { "[RabbitMQ] Circuit breaker open, cannot publish: #{e.message}" }
+        raise Error, "Publishing circuit breaker is open"
+      rescue => e
+        logger.error { "[RabbitMQ] Publish failed: #{e.message}" }
+        raise
       end
 
       # Override subscribe to add RabbitMQ-specific queue and consumer setup
@@ -226,8 +241,72 @@ module SmartMessage
         subscribe_pattern(pattern, :process, {})
       end
 
+      # Get circuit breaker statistics
+      def circuit_stats
+        @circuits.transform_values(&:stats)
+      end
+
+      # Reset circuit breakers
+      def reset_circuits!(name = nil)
+        if name
+          @circuits[name]&.reset!
+          logger.info { "[RabbitMQ] Reset circuit: #{name}" }
+        else
+          @circuits.each_value(&:reset!)
+          logger.info { "[RabbitMQ] Reset all circuits" }
+        end
+      end
+
+      # Get DLQ statistics
+      def dlq_stats
+        @dlq&.stats || { message_count: 0 }
+      end
+
+      # Inspect DLQ messages
+      def dlq_inspect(limit: 10)
+        @dlq&.inspect_messages(limit: limit) || []
+      end
+
+      # Purge DLQ
+      def dlq_purge!
+        @dlq&.purge!
+      end
 
       private
+
+      # Initialize circuit breakers
+      def initialize_circuits
+        @circuits[:publish] = CircuitBreaker.new(
+          :publish,
+          failure_threshold: @options[:publish_circuit_threshold] || 5,
+          timeout: @options[:publish_circuit_timeout] || 60,
+          reset_timeout: @options[:publish_circuit_reset] || 30
+        )
+
+        @circuits[:consume] = CircuitBreaker.new(
+          :consume,
+          failure_threshold: @options[:consume_circuit_threshold] || 10,
+          timeout: @options[:consume_circuit_timeout] || 120,
+          reset_timeout: @options[:consume_circuit_reset] || 60
+        )
+      end
+
+      # Setup dead letter queue
+      def setup_dead_letter_queue
+        return if @options[:disable_dlq]
+
+        @dlq = DeadLetterQueue.new(
+          @channel,
+          @options[:exchange_name],
+          durable: @options[:queue_durable],
+          ttl: @options[:dlq_ttl]
+        )
+
+        logger.debug { "[RabbitMQ] Dead Letter Queue enabled" }
+      rescue => e
+        logger.error { "[RabbitMQ] Failed to setup DLQ: #{e.message}" }
+        @dlq = nil
+      end
 
       # Override to use RabbitMQ-native dispatcher that leverages topic routing
       def create_dispatcher
@@ -396,15 +475,38 @@ module SmartMessage
             # Validate message headers
             if properties&.headers&.[]('message_class') == message_class.to_s
               logger.info { "[RabbitMQ] Received #{message_class} (#{payload.bytesize} bytes) with routing key: #{delivery_info.routing_key}" }
-              logger.info { "[RabbitMQ] Message content: #{payload}" }
-              receive(message_class.to_s, payload)
+              logger.debug { "[RabbitMQ] Message content: #{payload}" }
+
+              # Process with circuit breaker
+              @circuits[:consume].call do
+                receive(message_class.to_s, payload)
+              end
+
               @channel.ack(delivery_info.delivery_tag)
             else
               logger.warn { "[RabbitMQ] Message class mismatch, rejecting message" }
               @channel.reject(delivery_info.delivery_tag, false)
             end
+          rescue CircuitBreaker::CircuitOpenError => e
+            logger.error { "[RabbitMQ] Consumer circuit breaker open: #{e.message}" }
+            # Requeue message for later retry
+            @channel.reject(delivery_info.delivery_tag, true)
           rescue => e
             logger.error { "[RabbitMQ] Error processing message: #{e.message}" }
+            logger.error { "[RabbitMQ] Backtrace: #{e.backtrace.first(3).join("\n")}" }
+
+            # Send to DLQ if available
+            if @dlq
+              @dlq.send_to_dlq(
+                message_class,
+                payload,
+                delivery_info.routing_key,
+                e,
+                { delivery_tag: delivery_info.delivery_tag }
+              )
+            end
+
+            # Reject without requeue (already in DLQ)
             @channel.reject(delivery_info.delivery_tag, false)
           end
         end
@@ -590,3 +692,7 @@ module SmartMessage
 
   end
 end
+
+# Load nested classes after RabbitMQ class is defined
+require_relative "rabbitmq/circuit_breaker"
+require_relative "rabbitmq/dead_letter_queue"
