@@ -12,7 +12,7 @@ Gem::Specification.new do |spec|
   spec.description = "A RabbitMQ transport implementation for the SmartMessage library, providing reliable message queuing and routing capabilities with support for various exchange types and advanced routing patterns."
   spec.homepage = "https://github.com/MadBomber/smart_message-transport-rabbitmq"
   spec.license = "MIT"
-  spec.required_ruby_version = ">= 3.2.0"
+  spec.required_ruby_version = ">= 4.0"
 
   spec.metadata["allowed_push_host"] = "TODO: Set to your gem server 'https://example.com'"
   spec.metadata["homepage_uri"] = spec.homepage
